@@ -1,7 +1,7 @@
 MARIO KART TOUR 4.0.0 — ANDROID 16 EMULATOR SETUP
 ==================================================
 
-**NOTE. THIS FILE IS AI GENERATED FOR EFFICIENCY. We will make a better version later, but wanted to document our notes quickly.
+**NOTE. THIS FILE IS AI GENERATED FOR EFFICIENCY. We will make a better version later, but wanted to document our notes quickly.**
 
 Host:
 - Apple Silicon Mac (tested on Apple M4)
