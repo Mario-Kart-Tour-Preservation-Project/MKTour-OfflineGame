@@ -1,0 +1,147 @@
+# Mario Kart Tour 4.0.0 — Asset Pipeline & Ripping Guide
+
+Reverse-engineering notes for the Mario Kart Tour Preservation Project. Covers how Tour 4.0.0
+delivers content (the CDN, the catalog, and the "Nabe" encryption) and the full pipeline to rip
+the game's assets. **Methodology and tools only — no copyrighted assets are distributed here.**
+
+> Version this documents: `com.nintendo.zaka` 4.0.0, Android arm64, Unity 2022.3.69f1 (IL2CPP).
+> Older versions (1.x) worked differently — the awesomebytes zdict and plain-zstd approach do
+> **not** work on 4.0.0 (different dictionary, and the catalog is AES-encrypted now).
+
+---
+
+## 1. Big picture: where the content lives
+
+There are two separate back-ends:
+
+- **The API / game-logic server** (`api.mariokarttour.com`, via the DeNA "Sakasho" SDK + Nintendo
+  Account/NPF) — handles login, your save data, the current tour, master-data tables, matchmaking.
+  Payloads are encrypted (X25519/ECDH + AES-GCM) and gated by server-side Play Integrity.
+- **The CDN** (`download-cdn-mariokarttour.akamaized.net`, Akamai) — a plain HTTPS **file host** for
+  the game's content: characters, karts, courses, UI, audio, etc. **No account or running game is
+  needed to fetch from it** — you just need the right URLs. This is what you rip.
+
+The APK only bundles a **small offline subset** (`assets/_nabe_/*.zst`). The full game content
+(~2.4 GB) is downloaded from the CDN at runtime. So "the assets are in the APK" is only ~5% true.
+
+## 2. "Nabe" — Tour's asset encryption
+
+Nabe is Nintendo's asset system. Two layers of protection:
+
+**a) String obfuscation** — small constants (salts/passwords) are hidden with a repeating-XOR
+against a 4-byte key baked into the app. That key and the salt/password strings are stored in
+`global-metadata.dat`; you recover them by dumping IL2CPP (e.g. Il2CppDumper) and reading the
+`<PrivateImplementationDetails>` init-array constants (each is named `SHA256(data)`, which validates
+it). The one 4-byte constant that turns the salt blobs into clean ASCII when XORed is the key.
+
+**b) File encryption** — the catalog and encrypted asset files use standard .NET crypto:
+`RijndaelManaged` + `Rfc2898DeriveBytes`, i.e.
+
+```
+key || iv = PBKDF2-HMAC-SHA1(password, salt_utf8, iterations=1000)      # first 48 bytes
+plaintext = AES-256-CBC-decrypt(ciphertext, key=blob[0:32], iv=blob[32:48])   # PKCS7 padding
+```
+
+### Recovered values (4.0.0)
+
+You can extract these yourself with the method above; here they are for convenience:
+
+```
+cMofKey (repeating-XOR key)        : d2 9d bb c4
+File password (all catalogs+files) : kH7CmtifDe4JTkdYcB7GifKAHu2GqdhK
+Salt — offline catalog             : xM843PJdX9dN76cCN9d8xktBt6BgNuUL
+Salt — server catalog              : Bn4XC3N1G6rb50fXD2taWXKxbS6oGjRe
+Salt — zstd dictionary             : Nb1F7n5QR7plHLmZM4ojB5DAtT8bnN2J
+```
+
+So, concretely, to decrypt the server catalog:
+`key||iv = PBKDF2-HMAC-SHA1("kH7CmtifDe4JTkdYcB7GifKAHu2GqdhK", "Bn4XC3N1G6rb50fXD2taWXKxbS6oGjRe", 1000)[0:48]`,
+then AES-256-CBC. The offline catalog (`assets/_nabe_/_catalog.bytes`) uses the same password with
+the offline-catalog salt; the zstd dictionary (`_2ff16e1f.zst`) uses the same password with the
+zstd-dictionary salt.
+
+The **catalog** payload, once decrypted, is a **MessagePack-CSharp LZ4** container (ext type 99):
+`0xC9 <len BE32> 0x63 <msgpack-int uncompressedLen> <lz4-block>` → LZ4-block-decompress → MessagePack.
+
+There is also a **zstd dictionary** (bundled as an AES-encrypted `_nabe_/_2ff16e1f.zst`) used to
+inflate the bundled `_nabe_/*.zst` and some binary resources; decrypt it the same way (AES-256-CBC)
+then it's a normal cooked zstd dict.
+
+## 3. The catalog
+
+The game first downloads a **catalog** (a manifest) from the CDN. Decrypted, it's a MessagePack
+array; the important part is the list of **~5,050 "Packs"** covering **~20,000 files**. Each Pack:
+
+```
+[ cId(string), cStorageSize, cHash, cAvailability, cFiles[], cOffsetBegin[], cOffsetEnd[], cTags, cSourceHash ]
+```
+
+A **Pack is a concatenation of its member files**. File *i* is the byte range
+`pack[cOffsetBegin[i] : cOffsetEnd[i]]`. Each file entry carries its own id, size, hashes, a
+security flag, and its logical asset path.
+
+## 4. CDN URL structure
+
+The catalog and version files live at a base built from a product hash + a version token (both come
+from the API session; capture them once, or read them from a live catalog request):
+
+```
+BASE = https://download-cdn-mariokarttour.akamaized.net/assets/product/<PRODUCT_HASH>/<VERSION_TOKEN>/android/
+BASE + "catalog"     # the encrypted catalog
+BASE + "version"     # plaintext data-version number
+```
+
+Each **Pack**'s URL is:
+
+```
+pack_url = BASE + f"{xxh32(cId.encode('utf-16-le'), seed=0x2bde474d):08x}-{cSourceHash & 0xffffffff:08x}.pack"
+```
+
+i.e. `<XXHash32 of the pack id as UTF-16LE, seed 0x2bde474d>-<cSourceHash>.pack` (both lowercase,
+8 hex digits). The response size equals `cStorageSize`. Akamai returns **403 for any wrong/missing
+path** (not 404), so only exact URLs work. Range requests are supported (resumable downloads).
+
+## 5. File types inside a pack (magic bytes)
+
+| Magic | Type | Notes |
+|---|---|---|
+| `55 6e 69 74 79 46 53` (`UnityFS`) | Unity AssetBundle | plaintext — open with UnityPy / AssetStudio |
+| `41 4b 50 4b` (`AKPK`) | Wwise soundbank | raw `.pck`/`.bnk` |
+| `4d 73 67 53 74 64 42 6e` (`MsgStdBn`) | MessagePack text/localization | raw |
+| `89 50 4e 47` (`PNG`) | PNG image | raw |
+| — (security flag = 3) | AES-encrypted bundle | needs the per-file server key (see §7) |
+
+Most files (~93%) are plaintext and directly usable.
+
+## 6. The full ripping pipeline
+
+1. Dump IL2CPP → recover the XOR key + salt/password strings from `global-metadata.dat`.
+2. Fetch `BASE + "catalog"`, AES-decrypt it, LZ4-decompress, parse MessagePack → the Pack list.
+3. For each Pack, build its URL (§4) and download it (verify `size == cStorageSize`).
+4. For each Pack, slice files by `cOffsetBegin/cOffsetEnd`.
+5. `UnityFS` slices → open with **UnityPy** (they carry Unity **type trees**, so MonoBehaviour data
+   reads directly — no class mapping needed). Export textures/meshes/params, etc.
+6. `AKPK`/`PNG`/`MsgStdBn` slices → save raw.
+
+Libraries used: `cryptography` (AES + PBKDF2), `lz4`, `xxhash`, `zstandard`, `msgpack`, `UnityPy`.
+
+## 7. Master data (the one thing you can't decrypt)
+
+Client-side gameplay data **is** in the bundles and reads cleanly via UnityPy type trees: item
+parameters, item-slot (roulette) probability tables, kart physics constants, race scoring, AI,
+per-entity configs (models/icons/scale/descriptions).
+
+The **server-authoritative tables** (driver/kart base points, gacha rates, tour schedules) ship as
+`MasterData_<date>_enc` packs but are AES-encrypted with a key (`DataVersion.EncryptionHash`)
+delivered per-version by the Sakasho API — gated behind server-side Play Integrity, and the captured
+API traffic uses ephemeral ECDH (forward secrecy), so those tables **can't be decrypted offline**.
+Practical answer: reconstruct that data from the community wiki (rosters, special skills, rarity,
+tours, and the per-course favored/favorite affinity tables are all documented there).
+
+## 8. Relevance to an offline mod
+
+For a local-server offline mod you do **not** need to decrypt the server tables — you need a fake
+server that answers the handful of calls the game makes on boot (authenticate → menu, current
+tour/courses, ghost data, push race results) and serves user data. Since it's **your** server, the
+Play Integrity check is moot (you simply don't verify it). The assets can come from the CDN rip
+(this guide) and the data layer from the reconstructed wiki database.
